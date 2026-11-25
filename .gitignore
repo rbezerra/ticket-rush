@@ -1,0 +1,7 @@
+# Local state of AI coding tools; the shared, versioned documents live in docs/
+.claude/
+.cursor/
+.aider*
+.codex/
+.gemini/
+.DS_Store
