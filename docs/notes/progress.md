@@ -20,5 +20,5 @@ Branch: `agent/claude` (from tag `plan-v1`). Newest entry first.
 3. Continue with Task 2 (generate the Phoenix app). Do not skip Task 2, Step 5: record the names the generator really produced before writing tests, because the plan's snippets assume `TicketRush.DataCase`, `TicketRushWeb.ConnCase`, `use TicketRushWeb, :controller`/`:channel` and `~p` routes.
 
 **Decisions made so far (not obvious from the code)**
-- One branch per agent (`agent/<name>`), all created from tag `plan-v1`; `main` stays the shared baseline.
+- ~~One branch per agent (`agent/<name>`), all created from tag `plan-v1`.~~ Superseded 2026-11-25 by owner decision: branches are named per feature (`feature/phase-<N>-<name>`) and work is handed off between agents through this log. See "Branching and handoff" in `AGENTS.md`. `main` stays the shared baseline.
 - No BFF/gateway; production hardening, a React/TypeScript web app and CI/CD to Fly.io were added to the plan (see design doc).
