@@ -1,8 +1,31 @@
 # Progress log
 
-Branch: `agent/claude` (from tag `plan-v1`). Newest entry first.
+Newest entry first.
+
+## 2026-11-26 — Phase 1 complete (Tasks 1 and 2 verified)
+
+- **Agent:** Antigravity
+- **Branch:** `feature/phase-1-skeleton` (branched from `origin/agent/claude`, which started at `plan-v1`)
+
+**Done and verified**
+- Harness updated per owner request (`d916612`): switched from per-agent branches to feature branches (`feature/phase-<N>-<short-name>`) with handoff via `docs/notes/progress.md`.
+- Task 1, Step 5: `docker compose up -d db` and `docker compose ps db` verified `ticket-rush-db-1` (`postgres:17`) reaches `Up (healthy)`.
+- Task 2, Step 1: generated Phoenix API skeleton in `api/` via Docker `elixir:1.18` + `phx_new 1.8.17` (`--no-html --no-assets --no-mailer --no-gettext --no-dashboard --install`). Removed nested `api/.git` initialized by `phx.new`.
+- Task 2, Steps 2–4: updated `api/config/dev.exs` and `api/config/test.exs` to use `hostname: System.get_env("DATABASE_HOST", "localhost")`; ran `docker compose run --rm api mix ecto.create` (`The database for TicketRush.Repo has already been created`) and `docker compose run --rm -e MIX_ENV=test api mix test` (`2 tests, 0 failures`, `0.03s`).
+- Task 2, Steps 5–6: recorded generated module names, dependency versions (`phoenix ~> 1.8.17`, `ecto_sql ~> 3.13`, `bandit ~> 1.5`), and supervision tree study notes in `docs/notes/phase1.md`. All plan assumptions hold.
+
+**Not done**
+- Phase 2 (Ecto schemas and migrations) has not started.
+
+**Exact next step**
+1. Owner reviews and approves Phase 1 (optionally merging `feature/phase-1-skeleton` into `main`).
+2. Create `feature/phase-2-ecto` from `main` (or from `feature/phase-1-skeleton` if not yet merged) and start **Phase 2, Task 3** (migrations for `events`, `seats`, `reservations`, test-first with `api/test/ticket_rush/schema_invariant_test.exs`).
+
+---
 
 ## 2026-11-25 — stopped at Phase 1, Task 1, Step 5 (blocked by environment)
+
+- **Branch (historical):** `agent/claude` (from tag `plan-v1`).
 
 **Done and checked**
 - Task 1, Steps 1–4: created `docker-compose.yml` (services `db`, `api`, `bench`), `api/Dockerfile.dev`, `Makefile`, and appended build/dependency entries to `.gitignore`.
