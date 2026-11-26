@@ -5,3 +5,9 @@
 .codex/
 .gemini/
 .DS_Store
+_build/
+deps/
+node_modules/
+dist/
+*.beam
+.env
