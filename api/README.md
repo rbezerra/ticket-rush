@@ -16,9 +16,9 @@ This project runs **entirely inside Docker** — do not run `mix` directly on th
    ```bash
    docker compose run --rm api mix setup
    ```
-4. Start the Phoenix server (available at [`http://localhost:4000`](http://localhost:4000)):
+4. Start the Phoenix server in the background (available at [`http://localhost:4000`](http://localhost:4000); view logs with `docker compose logs -f api`):
    ```bash
-   docker compose up api
+   docker compose up -d api
    ```
 5. Run the test suite:
    ```bash

@@ -43,10 +43,12 @@ docker compose run --rm api mix setup
 ### 4. Start the Phoenix API server
 
 ```bash
-docker compose up api
+docker compose up -d api
 ```
 
-The API will be available at `http://localhost:4000`.
+The API will run in the background at `http://localhost:4000` (inspect logs with `docker compose logs -f api`).
+
+> Note: In Phase 1 (skeleton), no HTTP routes are defined yet, so requests to `http://localhost:4000/api` return `404` / `NoRouteError` until REST routes are added in Phase 5.
 
 ### 5. Run the test suite
 
