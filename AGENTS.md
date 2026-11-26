@@ -28,7 +28,7 @@ Working rules for any AI coding agent (or human) contributing to this repository
 Work is not tied to any agent. Any agent (or human) can continue another one's work.
 
 - **Branches are named after features, not agents:** `feature/phase-<N>-<short-name>` (e.g. `feature/phase-1-skeleton`, `feature/phase-3-strategy-b`). Use one branch per phase, created from `main` once the previous phase has been merged (or from the previous feature branch if it hasn't been merged yet). Other prefixes are fine for side work: `fix/<topic>`, `docs/<topic>`, `ci/<topic>`.
-- **`main`** is the shared baseline. Merge a feature branch into `main` only after the owner approves the phase.
+- **`main`** is the shared baseline. When finishing a phase (or stopping at a reviewable milestone), push the feature branch to `origin` and open a Pull Request against `main` so the owner can review and comment before merging. Never merge into `main` yourself.
 - **Handoff log:** `docs/notes/progress.md`, newest entry first. Before you stop (phase done, blocked, or out of budget), add an entry that says: date, `Agent:` (which tool/model), branch, what is done and verified (with real command output for verification steps), what is not done, and the exact next step. Commit it.
 - **Resuming:** read the newest progress entry, check out the branch it names, and verify its claims (e.g. re-run the last test command) before you build on top of them.
 - Agent names belong in progress entries and commit trailers if you want them, never in branch names.

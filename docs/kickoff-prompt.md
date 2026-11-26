@@ -32,7 +32,8 @@ worked on it before you; the repository is the only shared memory.
    and paste their real output in your summary. Do not claim a task is done
    unless its tests passed.
 5. Before you stop (finished, blocked, or out of budget), add a handoff entry
-   at the top of docs/notes/progress.md and commit it.
+   at the top of docs/notes/progress.md, commit it, push the feature branch,
+   and open a Pull Request against `main` for the owner to review.
 6. If something is unclear, blocked, or the plan looks wrong, stop and ask.
    Do not guess and do not work around blocked network or permissions.
 ```
