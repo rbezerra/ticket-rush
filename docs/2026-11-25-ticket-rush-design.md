@@ -29,9 +29,9 @@ Flow: hold a seat (5 min) → confirm (simulated payment). An expired hold is re
 
 ## Data model
 
-- `events` (id, name, starts_at, status)
-- `seats` (id, event_id, section, row, number, price_cents); unique `(event_id, section, row, number)`; index on `event_id`
-- `reservations` (id, seat_id, user_id, status `held|confirmed|expired|cancelled`, expires_at, idempotency_key, inserted_at)
+- `events` (id, name, starts_at, status `draft|on_sale|closed`)
+- `seats` (id, event_id, section, row, number, price_cents); unique `(event_id, section, row, number)` (its leftmost prefix already covers `event_id` lookups; add a standalone `event_id` index only if `EXPLAIN ANALYZE` proves a need)
+- `reservations` (id, seat_id, user_id `:bigint`, status `held|confirmed|expired|cancelled`, expires_at, idempotency_key, inserted_at); unique `(user_id, idempotency_key)`; `CHECK` constraints enforce valid `status` values; `user_id` is `:bigint` (no FK until Phase 9 adds `users`)
   - no `event_id`: it is redundant with `seats.event_id`. Revisit only if `EXPLAIN ANALYZE` justifies denormalizing.
 - `audit_events`: partitioned by month, fed by Broadway
 

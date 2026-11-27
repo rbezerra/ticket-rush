@@ -1,23 +1,23 @@
 # ticket-rush Implementation Plan
 
-> **For the executor (human or AI agent):** implement this plan task by task, in order. Every task is test-first: write the failing test, run it, implement, run it again, then commit. Stop at every 🛑 checkpoint and ask the project owner before continuing. See `AGENTS.md` for the working rules.
+> **For the executor (human or AI agent):** implement this plan task by task, in order. Every task is test-first: write the failing test, run it, implement, run it again, then commit. Stop at every 🛑 checkpoint and ask the project owner before continuing. See [`AGENTS.md`](../../AGENTS.md) for the working rules (test-first, Docker-only execution, small Conventional Commits, feature branches + PRs, and recording deviations in `docs/notes/`).
 
-**Goal:** Build a numbered-seat ticketing platform that stays correct under heavy contention, implemented with two interchangeable reservation strategies (OTP GenServer vs. Postgres locks) and compared with a benchmark. Doubles as a guided Elixir refresher.
+**Goal:** Build a numbered-seat ticketing platform that prevents double-booking under high concurrency (5k–10k concurrent buyers), implemented with two interchangeable reservation strategies (OTP GenServer vs. Postgres locks) and compared with a benchmark. Doubles as a guided Elixir refresher.
 
 **Architecture:** A Phoenix API owns the domain (`Reservations` context behind a `Strategy` behaviour). Strategy A uses one `EventArbiter` GenServer per event (Registry + DynamicSupervisor); Strategy B relies on Postgres transactions and a partial unique index. Oban expires holds, Broadway batches audit events, Channels push live seat updates. Clients talk to the Phoenix API directly (no BFF). The API is production-hardened (rate limiting, load shedding, token auth, health checks, telemetry, `mix release`). A React/TypeScript SPA in `web/` shows a live seat map and is served by the same release; `bench/` is a TypeScript load tool. GitHub Actions runs CI and deploys to Fly.io.
 
-**Tech Stack:** Elixir 1.18 / OTP 27, Phoenix, Ecto, Oban, Broadway, StreamData, PostgreSQL 17, Bcrypt, Telemetry, Docker Compose, GitHub Actions, Fly.io. Node 22 + TypeScript + React + Vite + Zod + Vitest + fast-check for `web/` and `bench/`.
+**Tech Stack:** Elixir 1.18 / OTP 28, Phoenix, Ecto, Oban, Broadway, StreamData, PostgreSQL 17, Bcrypt, Telemetry, Docker Compose, GitHub Actions, Fly.io. Node 22 + TypeScript + React + Vite + Zod + Vitest + fast-check for `web/` and `bench/`.
 
-**Design:** `docs/2026-11-25-ticket-rush-design.md`
+**Design:** [`docs/2026-11-25-ticket-rush-design.md`](../2026-11-25-ticket-rush-design.md)
 
 ## Conventions
 
-- Everything runs in Docker (`make` targets below). Nothing is installed on the host.
+- Everything runs in Docker (`make` targets below). Nothing is installed on the host. On hosts without `make` (e.g., Windows), run the equivalent `docker compose` commands directly (e.g., `docker compose run --rm -e MIX_ENV=test api mix test <path>`).
 - Docs, code, comments and commit messages are in English.
 - Commits use the repo-local personal identity (already configured). Never pass `--author` or change global config.
-- Every phase starts with an **Elixir Refresher** box. Read it before coding; it is the point of the exercise.
-- **STOP-and-ask checkpoints** (marked 🛑): the user asked to be consulted on doubts. Pause and ask before continuing.
-- Test failure messages are descriptive (standard debugging level): every assertion has a message.
+- Every phase starts with an **Elixir Refresher** box. Read it before coding.
+- **STOP-and-ask checkpoints** (marked 🛑): pause and confirm with the project owner before continuing.
+- Add a failure message to assertions whose invariant is not obvious from the expression alone.
 
 ## Known Environment Risks (read first)
 
@@ -172,42 +172,84 @@ git add -A && git commit -m "feat: generate phoenix api skeleton"
 ## Phase 2 — Ecto schemas and migrations
 
 > **Elixir Refresher: Ecto.**
-> `Repo` is the only door to the database. A *schema* maps a table to a struct. A *changeset* validates and casts input and declares constraint names (`unique_constraint`) so that database errors become `{:error, changeset}` instead of exceptions. Pattern matching on `{:ok, _}` / `{:error, _}` replaces exceptions for expected failures. `Ecto.Multi` composes several operations in one transaction.
+> `Repo` is the sole interface to the database. A *schema* maps a table to a struct. A *changeset* validates and casts input and declares constraint names (`unique_constraint`, `foreign_key_constraint`) so that database errors become `{:error, changeset}` instead of exceptions. Pattern matching on `{:ok, _}` / `{:error, _}` replaces exceptions for expected failures.
 
 ### Task 3: Migrations (events, seats, reservations)
 
 **Files:**
-- Create: `api/priv/repo/migrations/*_create_events_seats_reservations.exs`
+- Modify: `api/config/config.exs` (add `config :ticket_rush, TicketRush.Repo, migration_timestamps: [type: :utc_datetime]`)
+- Create: `api/priv/repo/migrations/*_create_events_seats_reservations.exs` (generate inside Docker via `docker compose run --rm api mix ecto.gen.migration create_events_seats_reservations`)
+- Create: `docs/notes/phase2.md`
 - Test: `api/test/ticket_rush/schema_invariant_test.exs`
 
 **Step 1: Write the failing invariant test**
 
+Create `api/test/ticket_rush/schema_invariant_test.exs`:
+
 ```elixir
 defmodule TicketRush.SchemaInvariantTest do
   use TicketRush.DataCase, async: true
-  alias TicketRush.Repo
 
   setup do
     {:ok, %{rows: [[event_id]]}} =
       Repo.query("INSERT INTO events (name, starts_at, status, inserted_at, updated_at) VALUES ('E', now(), 'on_sale', now(), now()) RETURNING id")
     {:ok, %{rows: [[seat_id]]}} =
       Repo.query("INSERT INTO seats (event_id, section, row, number, price_cents, inserted_at, updated_at) VALUES ($1,'A','1',1,1000, now(), now()) RETURNING id", [event_id])
-    %{seat_id: seat_id}
+    %{event_id: event_id, seat_id: seat_id}
   end
 
-  defp insert_reservation(seat_id, status, key) do
-    Repo.query("INSERT INTO reservations (seat_id, user_id, status, expires_at, idempotency_key, inserted_at, updated_at) VALUES ($1,'u1',$2, now() + interval '5 min', $3, now(), now())", [seat_id, status, key])
+  defp insert_reservation(seat_id, status, key, user_id) do
+    Repo.query("INSERT INTO reservations (seat_id, user_id, status, expires_at, idempotency_key, inserted_at, updated_at) VALUES ($1,$2,$3, now() + interval '5 min', $4, now(), now())", [seat_id, user_id, status, key])
   end
 
-  test "database rejects a second active reservation for the same seat", %{seat_id: seat_id} do
-    assert {:ok, _} = insert_reservation(seat_id, "held", "k1")
+  test "database rejects a second held reservation for the same seat", %{seat_id: seat_id} do
+    assert {:ok, _} = insert_reservation(seat_id, "held", "k1", 1)
     assert {:error, %Postgrex.Error{postgres: %{constraint: "one_active_reservation_per_seat"}}} =
-             insert_reservation(seat_id, "held", "k2")
+             insert_reservation(seat_id, "held", "k2", 2)
+  end
+
+  test "database rejects a new hold on an already confirmed seat", %{seat_id: seat_id} do
+    assert {:ok, _} = insert_reservation(seat_id, "confirmed", "k1", 1)
+    assert {:error, %Postgrex.Error{postgres: %{constraint: "one_active_reservation_per_seat"}}} =
+             insert_reservation(seat_id, "held", "k2", 2)
   end
 
   test "an expired reservation does not block a new hold", %{seat_id: seat_id} do
-    assert {:ok, _} = insert_reservation(seat_id, "expired", "k1")
-    assert {:ok, _} = insert_reservation(seat_id, "held", "k2"), "expired rows must not occupy the seat"
+    assert {:ok, _} = insert_reservation(seat_id, "expired", "k1", 1)
+    assert {:ok, _} = insert_reservation(seat_id, "held", "k2", 2), "expired rows must not occupy the seat"
+  end
+
+  test "a cancelled reservation does not block a new hold", %{seat_id: seat_id} do
+    assert {:ok, _} = insert_reservation(seat_id, "cancelled", "k1", 1)
+    assert {:ok, _} = insert_reservation(seat_id, "held", "k2", 2), "cancelled rows must not occupy the seat"
+  end
+
+  test "database rejects invalid reservation status values", %{seat_id: seat_id} do
+    assert {:error, %Postgrex.Error{postgres: %{constraint: "reservations_status_check"}}} =
+             insert_reservation(seat_id, "invalid", "k1", 1)
+  end
+
+  test "database rejects invalid event status values" do
+    assert {:error, %Postgrex.Error{postgres: %{constraint: "events_status_check"}}} =
+             Repo.query("INSERT INTO events (name, starts_at, status, inserted_at, updated_at) VALUES ('Bad', now(), 'invalid', now(), now())")
+  end
+
+  test "database rejects negative seat prices", %{event_id: event_id} do
+    assert {:error, %Postgrex.Error{postgres: %{constraint: "seats_price_non_negative"}}} =
+             Repo.query("INSERT INTO seats (event_id, section, row, number, price_cents, inserted_at, updated_at) VALUES ($1,'A','1',2,-1, now(), now())", [event_id])
+  end
+
+  test "database rejects non-positive seat numbers", %{event_id: event_id} do
+    assert {:error, %Postgrex.Error{postgres: %{constraint: "seats_number_positive"}}} =
+             Repo.query("INSERT INTO seats (event_id, section, row, number, price_cents, inserted_at, updated_at) VALUES ($1,'A','1',0,1000, now(), now())", [event_id])
+  end
+
+  test "idempotency key is scoped per user_id", %{seat_id: seat_id} do
+    assert {:ok, _} = insert_reservation(seat_id, "expired", "same-key", 1)
+    assert {:ok, _} = insert_reservation(seat_id, "held", "same-key", 2),
+           "different users must be able to use the same idempotency key"
+    assert {:error, %Postgrex.Error{postgres: %{constraint: "reservations_user_idempotency_key_index"}}} =
+             insert_reservation(seat_id, "expired", "same-key", 1)
   end
 end
 ```
@@ -217,7 +259,16 @@ end
 Run: `make test ARGS=test/ticket_rush/schema_invariant_test.exs`
 Expected: FAIL (`relation "events" does not exist`).
 
-**Step 3: Write the migration**
+**Step 3: Configure UTC timestamps on `Repo` and write the migration**
+
+1. In `api/config/config.exs`, add a new config block **above** `import_config "#{config_env()}.exs"` (e.g., right after `config :ticket_rush, ecto_repos: ...`):
+
+```elixir
+config :ticket_rush, TicketRush.Repo,
+  migration_timestamps: [type: :utc_datetime]
+```
+
+2. Generate the migration file inside Docker (`docker compose run --rm api mix ecto.gen.migration create_events_seats_reservations`) and edit `api/priv/repo/migrations/*_create_events_seats_reservations.exs` (`timestamps(type: :utc_datetime)` is kept explicit in the migration for readability alongside the Repo default):
 
 ```elixir
 defmodule TicketRush.Repo.Migrations.CreateEventsSeatsReservations do
@@ -228,8 +279,10 @@ defmodule TicketRush.Repo.Migrations.CreateEventsSeatsReservations do
       add :name, :string, null: false
       add :starts_at, :utc_datetime, null: false
       add :status, :string, null: false, default: "on_sale"
-      timestamps()
+      timestamps(type: :utc_datetime)
     end
+    create constraint(:events, :events_status_check,
+             check: "status IN ('draft', 'on_sale', 'closed')")
 
     create table(:seats) do
       add :event_id, references(:events, on_delete: :delete_all), null: false
@@ -237,20 +290,24 @@ defmodule TicketRush.Repo.Migrations.CreateEventsSeatsReservations do
       add :row, :string, null: false
       add :number, :integer, null: false
       add :price_cents, :integer, null: false
-      timestamps()
+      timestamps(type: :utc_datetime)
     end
-    create index(:seats, [:event_id])
     create unique_index(:seats, [:event_id, :section, :row, :number])
+    create constraint(:seats, :seats_price_non_negative, check: "price_cents >= 0")
+    create constraint(:seats, :seats_number_positive, check: "number > 0")
 
     create table(:reservations) do
       add :seat_id, references(:seats, on_delete: :restrict), null: false
-      add :user_id, :string, null: false
+      add :user_id, :bigint, null: false
       add :status, :string, null: false
       add :expires_at, :utc_datetime, null: false
       add :idempotency_key, :string, null: false
-      timestamps()
+      timestamps(type: :utc_datetime)
     end
-    create unique_index(:reservations, [:idempotency_key])
+    create constraint(:reservations, :reservations_status_check,
+             check: "status IN ('held', 'confirmed', 'expired', 'cancelled')")
+    create unique_index(:reservations, [:user_id, :idempotency_key],
+             name: :reservations_user_idempotency_key_index)
     create unique_index(:reservations, [:seat_id],
              where: "status IN ('held','confirmed')",
              name: :one_active_reservation_per_seat)
@@ -262,10 +319,23 @@ end
 
 **Step 4: Run, expect pass**
 
-Run: `docker compose run --rm -e MIX_ENV=test api mix ecto.migrate && make test ARGS=test/ticket_rush/schema_invariant_test.exs`
-Expected: `2 tests, 0 failures`.
+Run: `make test ARGS=test/ticket_rush/schema_invariant_test.exs` (the `mix test` alias in `api/mix.exs` runs `ecto.create --quiet` and `ecto.migrate --quiet` automatically).
+Expected: `9 tests, 0 failures`.
 
-**Step 5: Study note.** In `docs/notes/phase2.md`, explain why the partial index makes the expiry index small and why `on_delete: :restrict` on reservations.
+**Step 5: Write study notes**
+
+Create `docs/notes/phase2.md` covering:
+- Why the `WHERE status = 'held'` predicate keeps `reservations_held_expiry_idx` small.
+- Why `on_delete: :restrict` is used on `reservations.seat_id`, and why production soft-closes events (`status = :closed`) instead of hard-deleting them to avoid sequential FK scans without a non-partial `seat_id` index.
+- Schema rationales and **Alternatives Considered & Trade-offs**:
+  - Partial unique index on `reservations(seat_id)` vs. a lockable `status`/`current_reservation_id` column on `seats`.
+  - `varchar + CHECK` + `Ecto.Enum` vs. native PostgreSQL `ENUM`.
+  - `:utc_datetime` (1-second precision) vs. `:utc_datetime_usec`.
+  - Relying on the leftmost prefix of `unique_index(:seats, [:event_id, :section, :row, :number])` instead of a separate `seats(event_id)` index.
+  - Per-user `[:user_id, :idempotency_key]` uniqueness vs. global `[:idempotency_key]`.
+- Scaling limits and downstream notes:
+  - Mutable `status` in both partial indexes disables PostgreSQL HOT updates on `reservations`; schedule `fillfactor` and `autovacuum` tuning in Phase 8.
+  - Cross-reference the normative forward contracts in `Active Schema Contracts (Phases 3–9)` below (atomic state-transition/expiry SQL guards and Phase 9 `user_id` FK rollout).
 
 **Step 6: Commit**
 
@@ -273,45 +343,141 @@ Expected: `2 tests, 0 failures`.
 git add -A && git commit -m "feat: add events, seats and reservations migrations"
 ```
 
-### Task 4: Schemas, changesets and context entrypoint
+### Task 4: Schemas, changesets, and test fixtures
 
 **Files:**
-- Create: `api/lib/ticket_rush/events/event.ex`, `seat.ex`, `api/lib/ticket_rush/reservations/reservation.ex`
+- Create: `api/lib/ticket_rush/events/event.ex`, `api/lib/ticket_rush/events/seat.ex`, `api/lib/ticket_rush/reservations/reservation.ex`
+- Create: `api/test/support/fixtures.ex`
 - Test: `api/test/ticket_rush/reservations/reservation_test.exs`
 
-**Step 1: Failing test**
+**Step 1: Write the failing changeset test**
+
+Create `api/test/ticket_rush/reservations/reservation_test.exs`:
 
 ```elixir
 defmodule TicketRush.Reservations.ReservationTest do
   use TicketRush.DataCase, async: true
-  alias TicketRush.Reservations.Reservation
+  alias TicketRush.{Fixtures, Reservations.Reservation}
 
-  test "hold_changeset requires seat, user and idempotency key" do
-    cs = Reservation.hold_changeset(%Reservation{}, %{})
-    refute cs.valid?, "empty attrs must be invalid"
-    assert %{seat_id: ["can't be blank"], user_id: ["can't be blank"], idempotency_key: ["can't be blank"]} = errors_on(cs)
+  defp future_expiry do
+    DateTime.utc_now() |> DateTime.add(300, :second) |> DateTime.truncate(:second)
   end
 
-  test "status is limited to the known values" do
-    cs = Reservation.hold_changeset(%Reservation{}, %{seat_id: 1, user_id: "u", idempotency_key: "k", expires_at: DateTime.utc_now()})
-    assert cs.valid?
-    assert Ecto.Changeset.get_field(cs, :status) == "held"
+  test "hold_changeset requires seat, user, expires_at and idempotency key" do
+    cs = Reservation.hold_changeset(%Reservation{}, %{})
+    refute cs.valid?, "empty attrs must be invalid"
+    assert %{
+             seat_id: ["can't be blank"],
+             user_id: ["can't be blank"],
+             idempotency_key: ["can't be blank"],
+             expires_at: ["can't be blank"]
+           } = errors_on(cs)
+  end
+
+  test "hold_changeset enforces :held status and rejects unknown or non-held statuses" do
+    valid_cs =
+      Reservation.hold_changeset(%Reservation{}, %{
+        seat_id: 1,
+        user_id: 1,
+        idempotency_key: "k",
+        expires_at: future_expiry()
+      })
+
+    assert valid_cs.valid?
+    assert Ecto.Changeset.get_field(valid_cs, :status) == :held
+
+    invalid_cs =
+      Reservation.hold_changeset(%Reservation{}, %{
+        seat_id: 1,
+        user_id: 1,
+        idempotency_key: "k",
+        expires_at: future_expiry(),
+        status: :bogus
+      })
+
+    refute invalid_cs.valid?, "unknown status values must be rejected"
+    assert %{status: ["is invalid"]} = errors_on(invalid_cs)
+
+    confirmed_cs =
+      Reservation.hold_changeset(%Reservation{}, %{
+        seat_id: 1,
+        user_id: 1,
+        idempotency_key: "k",
+        expires_at: future_expiry(),
+        status: :confirmed
+      })
+
+    refute confirmed_cs.valid?, "hold_changeset must only allow :held status"
+    assert %{status: ["is invalid"]} = errors_on(confirmed_cs)
+  end
+
+  test "hold_changeset rejects idempotency_key longer than 255 characters" do
+    cs =
+      Reservation.hold_changeset(%Reservation{}, %{
+        seat_id: 1,
+        user_id: 1,
+        idempotency_key: String.duplicate("a", 256),
+        expires_at: future_expiry()
+      })
+
+    refute cs.valid?, "idempotency_key over 255 chars must fail validation instead of raising a Postgres truncation error"
+    assert %{idempotency_key: ["should be at most 255 character(s)"]} = errors_on(cs)
+  end
+
+  test "hold_changeset maps nonexistent seat_id to a changeset error instead of raising" do
+    cs =
+      Reservation.hold_changeset(%Reservation{}, %{
+        seat_id: -1,
+        user_id: 1,
+        idempotency_key: "k-missing-seat",
+        expires_at: future_expiry()
+      })
+
+    assert {:error, failed_cs} = Repo.insert(cs)
+    assert %{seat_id: ["does not exist"]} = errors_on(failed_cs)
+  end
+
+  test "hold_changeset maps duplicate active seat to \"taken\" changeset error" do
+    seat = Fixtures.seat!()
+    attrs = %{seat_id: seat.id, user_id: 1, idempotency_key: "k1", expires_at: future_expiry()}
+    assert {:ok, _} = %Reservation{} |> Reservation.hold_changeset(attrs) |> Repo.insert()
+
+    dup_attrs = %{seat_id: seat.id, user_id: 2, idempotency_key: "k2", expires_at: future_expiry()}
+    assert {:error, failed_cs} = %Reservation{} |> Reservation.hold_changeset(dup_attrs) |> Repo.insert()
+    assert %{seat_id: ["taken"]} = errors_on(failed_cs)
+  end
+
+  test "hold_changeset maps duplicate (user_id, idempotency_key) to a changeset error" do
+    [seat1, seat2] = Fixtures.seats!(2)
+    attrs1 = %{seat_id: seat1.id, user_id: 1, idempotency_key: "dup-key", expires_at: future_expiry()}
+    assert {:ok, _} = %Reservation{} |> Reservation.hold_changeset(attrs1) |> Repo.insert()
+
+    attrs2 = %{seat_id: seat2.id, user_id: 1, idempotency_key: "dup-key", expires_at: future_expiry()}
+    assert {:error, failed_cs} = %Reservation{} |> Reservation.hold_changeset(attrs2) |> Repo.insert()
+    assert %{idempotency_key: ["has already been taken"]} = errors_on(failed_cs)
   end
 end
 ```
 
-**Step 2:** Run → FAIL (module missing).
+**Step 2: Run, expect failure**
 
-**Step 3: Implement**
+Run: `make test ARGS=test/ticket_rush/reservations/reservation_test.exs`
+Expected: FAIL (module missing).
+
+**Step 3: Implement schemas and fixtures**
+
+Create `api/lib/ticket_rush/reservations/reservation.ex`:
 
 ```elixir
 defmodule TicketRush.Reservations.Reservation do
   use Ecto.Schema
   import Ecto.Changeset
 
+  @timestamps_opts [type: :utc_datetime]
+
   schema "reservations" do
-    field :user_id, :string
-    field :status, :string, default: "held"
+    field :user_id, :integer
+    field :status, Ecto.Enum, values: [:held, :confirmed, :expired, :cancelled], default: :held
     field :expires_at, :utc_datetime
     field :idempotency_key, :string
     belongs_to :seat, TicketRush.Events.Seat
@@ -320,30 +486,43 @@ defmodule TicketRush.Reservations.Reservation do
 
   def hold_changeset(res, attrs) do
     res
-    |> cast(attrs, [:seat_id, :user_id, :idempotency_key, :expires_at])
-    |> validate_required([:seat_id, :user_id, :idempotency_key, :expires_at])
+    |> cast(attrs, [:seat_id, :user_id, :status, :idempotency_key, :expires_at])
+    |> validate_required([:seat_id, :user_id, :status, :idempotency_key, :expires_at])
+    |> validate_inclusion(:status, [:held])
+    |> validate_length(:idempotency_key, min: 1, max: 255)
+    |> foreign_key_constraint(:seat_id)
     |> unique_constraint(:seat_id, name: :one_active_reservation_per_seat, message: "taken")
-    |> unique_constraint(:idempotency_key)
+    |> unique_constraint(:idempotency_key, name: :reservations_user_idempotency_key_index)
   end
 end
 ```
 
-Create `api/lib/ticket_rush/events/event.ex` and `seat.ex`:
+Create `api/lib/ticket_rush/events/event.ex`:
 
 ```elixir
 defmodule TicketRush.Events.Event do
   use Ecto.Schema
+
+  @timestamps_opts [type: :utc_datetime]
+
   schema "events" do
     field :name, :string
     field :starts_at, :utc_datetime
-    field :status, :string, default: "on_sale"
+    field :status, Ecto.Enum, values: [:draft, :on_sale, :closed], default: :on_sale
     has_many :seats, TicketRush.Events.Seat
     timestamps()
   end
 end
+```
 
+Create `api/lib/ticket_rush/events/seat.ex`:
+
+```elixir
 defmodule TicketRush.Events.Seat do
   use Ecto.Schema
+
+  @timestamps_opts [type: :utc_datetime]
+
   schema "seats" do
     field :section, :string
     field :row, :string
@@ -354,22 +533,28 @@ defmodule TicketRush.Events.Seat do
   end
 end
 ```
-(Each module goes in its own file; they are shown together for brevity.)
 
-Create `api/test/support/fixtures.ex` (used by every later test):
+Create `api/test/support/fixtures.ex` (shared test fixtures for Phase 2 and later phases):
 
 ```elixir
 defmodule TicketRush.Fixtures do
   alias TicketRush.{Repo, Events.Event, Events.Seat}
 
   def event!(attrs \\ %{}) do
-    Repo.insert!(struct!(Event, Map.merge(%{name: "Show", starts_at: ~U[2030-01-01 20:00:00Z]}, attrs)))
+    defaults = %{name: "Show", starts_at: ~U[2030-01-01 20:00:00Z]}
+    attrs =
+      case Map.get(attrs, :starts_at) do
+        %DateTime{} = dt -> Map.put(attrs, :starts_at, DateTime.truncate(dt, :second))
+        _ -> attrs
+      end
+
+    Repo.insert!(struct!(Event, Map.merge(defaults, attrs)))
   end
 
   @doc "Inserts `n` seats for one event and returns them."
   def seats!(n, event \\ nil) do
     event = event || event!()
-    for i <- 1..n do
+    for i <- 1..n//1 do
       Repo.insert!(%Seat{event_id: event.id, section: "A", row: "1", number: i, price_cents: 1000})
     end
   end
@@ -378,9 +563,28 @@ defmodule TicketRush.Fixtures do
 end
 ```
 
-**Step 4:** Run → `0 failures`.
+**Step 4: Run, expect pass**
 
-**Step 5: Commit** — `git add -A && git commit -m "feat: add ecto schemas and hold changeset"`
+Run: `make test ARGS=test/ticket_rush/reservations/reservation_test.exs`
+Expected: `6 tests, 0 failures`.
+
+Then run the full test suite (`make test`) to confirm all Phase 1 and Phase 2 tests compile and pass together (`17 tests, 0 failures`).
+
+**Step 5: Commit**
+
+```bash
+git add -A && git commit -m "feat: add ecto schemas and hold changeset"
+```
+
+### Active Schema Contracts (Phases 3–9)
+
+These contracts are authoritative for Phases 3–9 where downstream snippets have not yet been updated:
+
+1. **Enum statuses:** `Reservation.status` (`:held | :confirmed | :expired | :cancelled`) and `Event.status` (`:draft | :on_sale | :closed`) are `Ecto.Enum` atoms in Elixir/Ecto (serialized as strings in JSON).
+2. **Integer `user_id`:** `reservations.user_id` is `:bigint` (`:integer` in Ecto, no FK until Phase 9 adds `users`). Use integer IDs (`1`, `2`) before Phase 9 auth; in Phase 9, clean/backfill synthetic rows, add the FK via `NOT VALID` + `VALIDATE CONSTRAINT`, and switch `Reservation` to `belongs_to :user` + `foreign_key_constraint(:user_id)`.
+3. **Per-user idempotency & dual unique indexes:** Idempotency lookups must filter by both `user_id` and `idempotency_key` (in Postgres queries and `EventArbiter`'s in-memory map). Because `reservations` enforces two unique indexes (`reservations_user_idempotency_key_index` and `one_active_reservation_per_seat`), Strategy B must disambiguate replay vs. `:taken` without running queries inside an aborted transaction.
+4. **Atomic state transitions & expiry:** `confirm/2` must update atomically with `WHERE id = $1 AND user_id = $2 AND status = 'held' AND expires_at > now()`, and Oban hold expiration must update with `WHERE status = 'held' AND expires_at <= now()`.
+5. **UTC timestamps:** All schema and migration timestamps use `:utc_datetime`.
 
 ---
 

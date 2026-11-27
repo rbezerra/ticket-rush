@@ -11,6 +11,9 @@ config :ticket_rush,
   ecto_repos: [TicketRush.Repo],
   generators: [timestamp_type: :utc_datetime]
 
+config :ticket_rush, TicketRush.Repo,
+  migration_timestamps: [type: :utc_datetime]
+
 # Configure the endpoint
 config :ticket_rush, TicketRushWeb.Endpoint,
   url: [host: "localhost"],
