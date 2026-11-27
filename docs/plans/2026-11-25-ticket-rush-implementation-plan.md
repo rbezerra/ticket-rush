@@ -2,9 +2,9 @@
 
 > **For the executor (human or AI agent):** implement this plan task by task, in order. Every task is test-first: write the failing test, run it, implement, run it again, then commit. Stop at every 🛑 checkpoint and ask the project owner before continuing. See [`AGENTS.md`](../../AGENTS.md) for the working rules (test-first, Docker-only execution, small Conventional Commits, feature branches + PRs, and recording deviations in `docs/notes/`).
 
-**Goal:** Build a numbered-seat ticketing platform that prevents double-booking under high concurrency (5k–10k concurrent buyers), implemented with two interchangeable reservation strategies (OTP GenServer vs. Postgres locks) and compared with a benchmark. Doubles as a guided Elixir refresher.
+**Goal:** Build a numbered-seat ticketing platform that prevents double-booking under high concurrency (5k–10k concurrent buyers), implemented with two interchangeable reservation strategies (OTP GenServer vs. Postgres constraints and atomic queries) and compared with a benchmark. Doubles as a guided Elixir refresher.
 
-**Architecture:** A Phoenix API owns the domain (`Reservations` context behind a `Strategy` behaviour). Strategy A uses one `EventArbiter` GenServer per event (Registry + DynamicSupervisor); Strategy B relies on Postgres transactions and a partial unique index. Oban expires holds, Broadway batches audit events, Channels push live seat updates. Clients talk to the Phoenix API directly (no BFF). The API is production-hardened (rate limiting, load shedding, token auth, health checks, telemetry, `mix release`). A React/TypeScript SPA in `web/` shows a live seat map and is served by the same release; `bench/` is a TypeScript load tool. GitHub Actions runs CI and deploys to Fly.io.
+**Architecture:** A Phoenix API owns the domain (`Reservations` context behind a `Strategy` behaviour). Strategy A uses one `EventArbiter` GenServer per event (Registry + DynamicSupervisor); Strategy B relies on a partial unique index and atomic single-statement SQL. Oban expires holds, Broadway batches audit events, Channels push live seat updates. Clients talk to the Phoenix API directly (no BFF). The API includes rate limiting, load shedding, token auth, health checks, telemetry, and `mix release`. A React/TypeScript SPA in `web/` shows a live seat map and is served by the same release; `bench/` is a TypeScript load tool. GitHub Actions runs CI and deploys to Fly.io.
 
 **Tech Stack:** Elixir 1.18 / OTP 28, Phoenix, Ecto, Oban, Broadway, StreamData, PostgreSQL 17, Bcrypt, Telemetry, Docker Compose, GitHub Actions, Fly.io. Node 22 + TypeScript + React + Vite + Zod + Vitest + fast-check for `web/` and `bench/`.
 
@@ -576,30 +576,37 @@ Then run the full test suite (`make test`) to confirm all Phase 1 and Phase 2 te
 git add -A && git commit -m "feat: add ecto schemas and hold changeset"
 ```
 
-### Active Schema Contracts (Phases 3–9)
+---
 
-These contracts are authoritative for Phases 3–9 where downstream snippets have not yet been updated:
+## Active Schema Contracts (Phases 3–9)
 
-1. **Enum statuses:** `Reservation.status` (`:held | :confirmed | :expired | :cancelled`) and `Event.status` (`:draft | :on_sale | :closed`) are `Ecto.Enum` atoms in Elixir/Ecto (serialized as strings in JSON).
+These contracts are authoritative for Phases 4–9 where downstream snippets have not yet been updated (Phase 3 is already aligned):
+
+1. **Enum statuses:** `Reservation.status` (`:held | :confirmed | :expired | :cancelled`) and `Event.status` (`:draft | :on_sale | :closed`) are `Ecto.Enum` atoms in Elixir/Ecto (serialized as strings in JSON). `Reservation.hold_changeset/2` defaults `status` to `:held`, rejects non-`:held` values, and validates `idempotency_key` length (1..255).
 2. **Integer `user_id`:** `reservations.user_id` is `:bigint` (`:integer` in Ecto, no FK until Phase 9 adds `users`). Use integer IDs (`1`, `2`) before Phase 9 auth; in Phase 9, clean/backfill synthetic rows, add the FK via `NOT VALID` + `VALIDATE CONSTRAINT`, and switch `Reservation` to `belongs_to :user` + `foreign_key_constraint(:user_id)`.
-3. **Per-user idempotency & dual unique indexes:** Idempotency lookups must filter by both `user_id` and `idempotency_key` (in Postgres queries and `EventArbiter`'s in-memory map). Because `reservations` enforces two unique indexes (`reservations_user_idempotency_key_index` and `one_active_reservation_per_seat`), Strategy B must disambiguate replay vs. `:taken` without running queries inside an aborted transaction.
-4. **Atomic state transitions & expiry:** `confirm/2` must update atomically with `WHERE id = $1 AND user_id = $2 AND status = 'held' AND expires_at > now()`, and Oban hold expiration must update with `WHERE status = 'held' AND expires_at <= now()`.
+3. **Per-user idempotency & dual unique indexes:** Idempotency lookups must filter by both `user_id` and `idempotency_key` (in Postgres queries and `EventArbiter`'s in-memory map). `reservations` enforces two unique indexes — `reservations_user_idempotency_key_index` on `(user_id, idempotency_key)` and `one_active_reservation_per_seat` on `(seat_id) WHERE status IN ('held','confirmed')` — so Strategy B must disambiguate replay vs. `:taken` without running queries inside an aborted transaction (SQLSTATE `25P02`). Because `reservations_user_idempotency_key_index` is non-partial, replaying a key whose original reservation is `:expired` or `:cancelled` still returns `{:replayed, existing}` (same `seat_id`) or `{:error, :idempotency_conflict}` (different `seat_id`); Strategy A must preserve this parity across restarts.
+4. **Atomic state transitions & expiry:** `confirm/2` must update atomically with `WHERE id = $1 AND user_id = $2 AND status = 'held' AND expires_at > now()` (returning `{:error, :expired}` for both lapsed `:held` and already-`:expired` rows), `release/2` must update atomically with `WHERE id = $1 AND user_id = $2 AND status = 'held' AND expires_at > now()`, and Oban hold expiration must update with `WHERE status = 'held' AND expires_at <= now()`.
 5. **UTC timestamps:** All schema and migration timestamps use `:utc_datetime`.
 
 ---
 
 ## Phase 3 — Strategy B (Postgres only)
 
-> **Elixir Refresher: behaviours and `Repo.transaction`.**
-> A `@behaviour` is a compile-time contract (`@callback`) — Elixir's interface. `Repo.transaction/1` rolls back when the function raises or returns `Repo.rollback/1`; `{:error, changeset}` from `Repo.insert` does *not* roll back by itself, you must handle it. `with` chains happy-path matches and falls through on the first mismatch.
+> **Elixir Refresher: behaviours and atomic Postgres queries.**
+> A `@behaviour` is a compile-time contract (`@callback`) — Elixir's interface. Under high contention, read-then-write (`Repo.get` followed by `Repo.update`) has a TOCTOU race; instead, push state guards into a single atomic SQL statement: `Repo.insert(..., on_conflict: :nothing, returning: true)` (which returns `{:ok, %Reservation{id: nil}}` when a unique conflict suppresses the insert without aborting the transaction) and conditional `Repo.update_all/3` with `select: r` in the query (emitting SQL `RETURNING`). Reserve `Repo.transaction/1` + `Ecto.Multi` for multi-statement atomic writes.
 
 ### Task 5: Strategy behaviour and Postgres implementation
 
 **Files:**
-- Create: `api/lib/ticket_rush/reservations/strategy.ex`, `postgres.ex`, `api/lib/ticket_rush/reservations.ex`, `api/test/support/reservation_strategy_case.ex`
+- Modify: `api/lib/ticket_rush/reservations/reservation.ex` (add `@type t :: %__MODULE__{}`)
+- Create: `api/lib/ticket_rush/reservations/strategy.ex`, `api/lib/ticket_rush/reservations/postgres.ex`, `api/lib/ticket_rush/reservations.ex`
+- Create: `api/test/support/reservation_strategy_case.ex`
+- Create: `docs/notes/phase3.md`
 - Test: `api/test/ticket_rush/reservations/postgres_test.exs`
 
-**Step 1: Shared test case so both strategies run the same tests**
+**Step 1: Write the shared contract test case**
+
+Create `api/test/support/reservation_strategy_case.ex` so both Strategy B (Postgres) and Strategy A (OTP) run the same contract suite:
 
 ```elixir
 defmodule TicketRush.ReservationStrategyCase do
@@ -613,132 +620,358 @@ defmodule TicketRush.ReservationStrategyCase do
       setup do: %{seat: Fixtures.seat!()}
 
       test "hold succeeds on a free seat", %{seat: seat} do
-        assert {:ok, res} = @strategy.hold(seat.id, "u1", idempotency_key: "k1")
-        assert res.status == "held", "new reservation must be held"
+        assert {:ok, res} = @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "k1")
+        assert res.status == :held, "new reservation must be held"
+      end
+
+      test "hold rejects nonexistent seat, event_id/seat_id mismatch, or missing idempotency_key", %{seat: seat} do
+        other_event = Fixtures.event!()
+
+        assert {:error, %Ecto.Changeset{}} = @strategy.hold(seat.event_id, seat.id, 1, [])
+
+        assert {:error, :seat_not_found} =
+                 @strategy.hold(seat.event_id, -1, 1, idempotency_key: "k-missing")
+
+        assert {:error, :seat_not_found} =
+                 @strategy.hold(other_event.id, seat.id, 1, idempotency_key: "k-mismatch"),
+               "seat belonging to another event must be rejected"
       end
 
       test "second hold on the same seat is :taken", %{seat: seat} do
-        {:ok, _} = @strategy.hold(seat.id, "u1", idempotency_key: "k1")
-        assert {:error, :taken} = @strategy.hold(seat.id, "u2", idempotency_key: "k2")
+        {:ok, _} = @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "k1")
+        assert {:error, :taken} = @strategy.hold(seat.event_id, seat.id, 2, idempotency_key: "k2")
       end
 
-      test "same idempotency key returns the original reservation", %{seat: seat} do
-        {:ok, a} = @strategy.hold(seat.id, "u1", idempotency_key: "k1")
-        assert {:replayed, b} = @strategy.hold(seat.id, "u1", idempotency_key: "k1")
+      test "same idempotency key for same user and seat returns the original reservation", %{seat: seat} do
+        {:ok, a} = @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "k1")
+        assert {:replayed, b} = @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "k1")
         assert a.id == b.id, "replay must not create a second reservation"
       end
 
-      test "an expired hold frees the seat", %{seat: seat} do
-        {:ok, _} = @strategy.hold(seat.id, "u1", idempotency_key: "k1", ttl_seconds: -1)
-        assert {:ok, _} = @strategy.hold(seat.id, "u2", idempotency_key: "k2")
+      test "replaying an idempotency key after release or expiry still returns {:replayed, existing}", %{seat: seat} do
+        {:ok, r1} = @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "k-rel")
+        {:ok, _} = @strategy.release(r1.id, 1)
+
+        assert {:replayed, %{id: id1, status: :cancelled}} =
+                 @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "k-rel")
+        assert id1 == r1.id
+
+        {:ok, r2} = @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "k-exp", ttl_seconds: -60)
+        {:ok, _} = @strategy.hold(seat.event_id, seat.id, 2, idempotency_key: "k-other")
+
+        assert {:replayed, %{id: id2, status: :expired}} =
+                 @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "k-exp")
+        assert id2 == r2.id
       end
 
-      test "confirm moves held to confirmed; release frees the seat", %{seat: seat} do
-        {:ok, r} = @strategy.hold(seat.id, "u1", idempotency_key: "k1")
-        assert {:ok, %{status: "confirmed"}} = @strategy.confirm(r.id, "u1")
-        {:ok, r2} = @strategy.hold(Fixtures.seat!().id, "u1", idempotency_key: "k3")
-        assert {:ok, %{status: "cancelled"}} = @strategy.release(r2.id)
+      test "same idempotency key for same user on a different seat is :idempotency_conflict", %{seat: seat} do
+        other_seat = Fixtures.seat!()
+        {:ok, _} = @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "k1")
+
+        assert {:error, :idempotency_conflict} =
+                 @strategy.hold(other_seat.event_id, other_seat.id, 1, idempotency_key: "k1")
+      end
+
+      test "idempotency key is isolated per user", %{seat: seat} do
+        other_seat = Fixtures.seat!()
+        assert {:ok, r1} = @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "shared-key")
+        assert {:ok, r2} = @strategy.hold(other_seat.event_id, other_seat.id, 2, idempotency_key: "shared-key")
+        refute r1.id == r2.id, "different users sharing an idempotency key must not replay each other"
+      end
+
+      test "an expired hold frees the seat", %{seat: seat} do
+        {:ok, _} = @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "k1", ttl_seconds: -60)
+        assert {:ok, _} = @strategy.hold(seat.event_id, seat.id, 2, idempotency_key: "k2")
+      end
+
+      test "confirm moves held to confirmed and handles error states including already-expired rows", %{seat: seat} do
+        {:ok, r} = @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "k1")
+        assert {:error, :not_found} = @strategy.confirm(r.id, 2), "wrong user must not confirm"
+        assert {:ok, %{status: :confirmed}} = @strategy.confirm(r.id, 1)
+        assert {:error, :not_held} = @strategy.confirm(r.id, 1), "already confirmed must return :not_held"
+
+        expired_seat = Fixtures.seat!()
+        {:ok, r_exp} = @strategy.hold(expired_seat.event_id, expired_seat.id, 1, idempotency_key: "k-exp", ttl_seconds: -60)
+        assert {:error, :expired} = @strategy.confirm(r_exp.id, 1), "lapsed held row must return :expired"
+
+        # Trigger lazy expiry so status is already :expired in Postgres, then confirm again
+        {:ok, _} = @strategy.hold(expired_seat.event_id, expired_seat.id, 2, idempotency_key: "k-sweeper")
+        assert {:error, :expired} = @strategy.confirm(r_exp.id, 1), "already-expired row must still return :expired"
+      end
+
+      test "release cancels a held reservation and rejects confirmed, expired, or unowned reservations", %{seat: seat} do
+        {:ok, r} = @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "k1")
+        assert {:error, :not_found} = @strategy.release(r.id, 2), "wrong user must not release"
+        assert {:ok, %{status: :cancelled}} = @strategy.release(r.id, 1)
+        assert {:error, :not_held} = @strategy.release(r.id, 1)
+
+        expired_seat = Fixtures.seat!()
+        {:ok, r_exp} = @strategy.hold(expired_seat.event_id, expired_seat.id, 1, idempotency_key: "k-exp-rel", ttl_seconds: -60)
+        assert {:error, :not_held} = @strategy.release(r_exp.id, 1), "expired hold must not be marked :cancelled"
+
+        sold_seat = Fixtures.seat!()
+        {:ok, r_sold} = @strategy.hold(sold_seat.event_id, sold_seat.id, 1, idempotency_key: "k-sold")
+        {:ok, _} = @strategy.confirm(r_sold.id, 1)
+        assert {:error, :not_held} = @strategy.release(r_sold.id, 1), "confirmed reservations must never be cancelled by release"
+      end
+
+      test "parallel tasks on the same seat allow only one winner (shared sandbox logical contract)", %{seat: seat} do
+        results =
+          1..2
+          |> Task.async_stream(
+            fn user_id ->
+              @strategy.hold(seat.event_id, seat.id, user_id, idempotency_key: "race-#{user_id}")
+            end,
+            ordered: false
+          )
+          |> Enum.map(fn {:ok, res} -> res end)
+
+        assert Enum.count(results, &match?({:ok, _}, &1)) == 1
+        assert Enum.count(results, &match?({:error, :taken}, &1)) == 1
+      end
+
+      test "parallel retries with the same (user_id, idempotency_key) return one :ok and one :replayed", %{seat: seat} do
+        results =
+          1..2
+          |> Task.async_stream(
+            fn _ ->
+              @strategy.hold(seat.event_id, seat.id, 1, idempotency_key: "same-race-key")
+            end,
+            ordered: false
+          )
+          |> Enum.map(fn {:ok, res} -> res end)
+
+        assert Enum.count(results, &match?({:ok, _}, &1)) == 1
+        assert Enum.count(results, &match?({:replayed, _}, &1)) == 1
       end
     end
   end
 end
 ```
 
-`Fixtures` comes from Task 4. Note the contract below: `hold/3` returns `{:ok, res}` for a new reservation and `{:replayed, res}` for a repeated idempotency key (the controller maps these to 201 and 200). This shape is final; later tasks must not change it.
+Contract: `hold/4` defaults `:ttl_seconds` to `300` (an internal/test option; Phase 5 API callers do not control TTL), replays `{:replayed, res}` on repeated `(user_id, idempotency_key)` for the same seat, and returns `{:error, :idempotency_conflict}` for a different seat. `use TicketRush.DataCase, async: false` runs Ecto's `SQL.Sandbox` in shared mode so `Task.async_stream` tasks share the test connection (serializing DB queries on one transaction; true multi-connection concurrency testing runs in Phase 7). Each `Fixtures.seat!/0` call persists a distinct seat with its own event.
 
-**Step 2: Behaviour and test file**
+**Step 2: Write the behaviour and Postgres test file**
+
+Add `@type t :: %__MODULE__{}` to `api/lib/ticket_rush/reservations/reservation.ex` **after** the `schema "reservations" do ... end` block.
+
+Create `api/lib/ticket_rush/reservations/strategy.ex`:
 
 ```elixir
 defmodule TicketRush.Reservations.Strategy do
   alias TicketRush.Reservations.Reservation
+
   @type hold_opts :: [idempotency_key: String.t(), ttl_seconds: integer()]
-  @callback hold(seat_id :: integer(), user_id :: String.t(), hold_opts()) ::
-              {:ok, Reservation.t()} | {:replayed, Reservation.t()} | {:error, :taken | Ecto.Changeset.t()}
-  @callback confirm(reservation_id :: integer(), user_id :: String.t()) ::
+
+  @callback hold(event_id :: integer(), seat_id :: integer(), user_id :: integer(), hold_opts()) ::
+              {:ok, Reservation.t()}
+              | {:replayed, Reservation.t()}
+              | {:error, :taken | :seat_not_found | :idempotency_conflict | Ecto.Changeset.t()}
+
+  @callback confirm(reservation_id :: integer(), user_id :: integer()) ::
               {:ok, Reservation.t()} | {:error, :not_found | :expired | :not_held}
-  @callback release(reservation_id :: integer()) :: {:ok, Reservation.t()} | {:error, :not_found}
+
+  @callback release(reservation_id :: integer(), user_id :: integer()) ::
+              {:ok, Reservation.t()} | {:error, :not_found | :not_held}
 end
 ```
-(Add `@type t :: %__MODULE__{}` to `Reservation`.)
+
+Create `api/test/ticket_rush/reservations/postgres_test.exs`:
 
 ```elixir
 defmodule TicketRush.Reservations.PostgresTest do
   use TicketRush.ReservationStrategyCase, strategy: TicketRush.Reservations.Postgres
+
+  test "Reservations facade delegates to the default Postgres strategy", %{seat: seat} do
+    assert TicketRush.Reservations.strategy() == TicketRush.Reservations.Postgres
+    assert {:ok, res} = TicketRush.Reservations.hold(seat.event_id, seat.id, 1, idempotency_key: "facade-k1")
+    assert {:ok, %{status: :confirmed}} = TicketRush.Reservations.confirm(res.id, 1)
+  end
 end
 ```
 
-**Step 3:** Run → FAIL (module undefined).
+**Step 3: Run, expect failure**
 
-**Step 4: Implement**
+Run: `make test ARGS=test/ticket_rush/reservations/postgres_test.exs`
+Expected: FAIL (`TicketRush.Reservations.Postgres` is undefined).
+
+**Step 4: Implement Strategy B (Postgres) and the `Reservations` facade**
+
+Create `api/lib/ticket_rush/reservations/postgres.ex`:
 
 ```elixir
 defmodule TicketRush.Reservations.Postgres do
   @behaviour TicketRush.Reservations.Strategy
+
   import Ecto.Query
+  alias TicketRush.Events.Seat
   alias TicketRush.Repo
   alias TicketRush.Reservations.Reservation
 
   @impl true
-  def hold(seat_id, user_id, opts) do
-    key = Keyword.fetch!(opts, :idempotency_key)
+  def hold(event_id, seat_id, user_id, opts) do
+    key = Keyword.get(opts, :idempotency_key)
     ttl = Keyword.get(opts, :ttl_seconds, 300)
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
 
-    case find_by_key(key) do
-      %Reservation{} = existing -> {:replayed, existing}
-      nil -> do_hold(seat_id, user_id, key, ttl)
+    attrs = %{
+      seat_id: seat_id,
+      user_id: user_id,
+      idempotency_key: key,
+      expires_at: DateTime.add(now, ttl, :second)
+    }
+
+    cs = Reservation.hold_changeset(%Reservation{}, attrs)
+
+    cond do
+      not cs.valid? ->
+        {:error, cs}
+
+      not Repo.exists?(from s in Seat, where: s.id == ^seat_id and s.event_id == ^event_id) ->
+        {:error, :seat_not_found}
+
+      true ->
+        attempt_hold(cs, seat_id, user_id, key, _allow_retry? = true)
     end
   end
 
-  @doc "Used by every strategy so replays are answered before any seat arbitration."
-  def find_by_key(key), do: Repo.get_by(Reservation, idempotency_key: key)
+  defp attempt_hold(cs, seat_id, user_id, key, allow_retry?) do
+    case Repo.insert(cs, on_conflict: :nothing, returning: true) do
+      {:ok, %Reservation{id: nil}} ->
+        resolve_conflict(cs, seat_id, user_id, key, allow_retry?)
 
-  defp do_hold(seat_id, user_id, key, ttl) do
-    now = DateTime.utc_now() |> DateTime.truncate(:second)
+      {:ok, %Reservation{} = res} ->
+        {:ok, res}
 
-    Repo.transaction(fn ->
-      # Free the seat if its previous hold already lapsed but Oban has not run yet.
-      from(r in Reservation, where: r.seat_id == ^seat_id and r.status == "held" and r.expires_at < ^now)
-      |> Repo.update_all(set: [status: "expired"])
+      {:error, %Ecto.Changeset{} = invalid_cs} ->
+        {:error, invalid_cs}
+    end
+  end
 
-      attrs = %{seat_id: seat_id, user_id: user_id, idempotency_key: key,
-                expires_at: DateTime.add(now, ttl)}
+  defp resolve_conflict(cs, seat_id, user_id, key, allow_retry?) do
+    case Repo.get_by(Reservation, user_id: user_id, idempotency_key: key) do
+      %Reservation{seat_id: ^seat_id} = existing ->
+        {:replayed, existing}
 
-      case Repo.insert(Reservation.hold_changeset(%Reservation{}, attrs)) do
-        {:ok, res} -> res
-        {:error, %{errors: [seat_id: {"taken", _}]}} -> Repo.rollback(:taken)
-        {:error, cs} -> Repo.rollback(cs)
-      end
-    end)
+      %Reservation{} ->
+        {:error, :idempotency_conflict}
+
+      nil when allow_retry? ->
+        now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+        {expired_count, _} =
+          from(r in Reservation,
+            where:
+              r.seat_id == ^seat_id and r.status == :held and
+                r.expires_at <= fragment("now()")
+          )
+          |> Repo.update_all(set: [status: :expired, updated_at: now])
+
+        if expired_count > 0 do
+          attempt_hold(cs, seat_id, user_id, key, false)
+        else
+          {:error, :taken}
+        end
+
+      nil ->
+        {:error, :taken}
+    end
   end
 
   @impl true
   def confirm(id, user_id) do
-    now = DateTime.utc_now()
-    case Repo.get_by(Reservation, id: id, user_id: user_id) do
-      nil -> {:error, :not_found}
-      %{status: "held", expires_at: exp} = r ->
-        if DateTime.compare(exp, now) == :gt,
-          do: r |> Ecto.Changeset.change(status: "confirmed") |> Repo.update(),
-          else: {:error, :expired}
-      _ -> {:error, :not_held}
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    query =
+      from(r in Reservation,
+        where:
+          r.id == ^id and r.user_id == ^user_id and r.status == :held and
+            r.expires_at > fragment("now()"),
+        select: r
+      )
+
+    case Repo.update_all(query, set: [status: :confirmed, updated_at: now]) do
+      {1, [res]} ->
+        {:ok, res}
+
+      {0, _} ->
+        case Repo.get_by(Reservation, id: id, user_id: user_id) do
+          nil -> {:error, :not_found}
+          %Reservation{status: status} when status in [:held, :expired] -> {:error, :expired}
+          %Reservation{} -> {:error, :not_held}
+        end
     end
   end
 
   @impl true
-  def release(id) do
-    case Repo.get(Reservation, id) do
-      nil -> {:error, :not_found}
-      r -> r |> Ecto.Changeset.change(status: "cancelled") |> Repo.update()
+  def release(id, user_id) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    query =
+      from(r in Reservation,
+        where:
+          r.id == ^id and r.user_id == ^user_id and r.status == :held and
+            r.expires_at > fragment("now()"),
+        select: r
+      )
+
+    case Repo.update_all(query, set: [status: :cancelled, updated_at: now]) do
+      {1, [res]} ->
+        {:ok, res}
+
+      {0, _} ->
+        case Repo.get_by(Reservation, id: id, user_id: user_id) do
+          nil -> {:error, :not_found}
+          %Reservation{} -> {:error, :not_held}
+        end
     end
   end
 end
 ```
 
-Create `TicketRush.Reservations` (facade) with `def strategy, do: Application.get_env(:ticket_rush, :reservation_strategy, TicketRush.Reservations.Postgres)` and delegating `hold/3`, `confirm/2`, `release/1`.
+Create `api/lib/ticket_rush/reservations.ex` (context facade):
 
-**Step 5:** Run `make test ARGS=test/ticket_rush/reservations/postgres_test.exs` → `5 tests, 0 failures`.
+```elixir
+defmodule TicketRush.Reservations do
+  @moduledoc "Domain entrypoint delegating reservation operations to the configured strategy."
 
-**Step 6: Commit** — `git commit -am "feat: add reservation strategy behaviour and postgres strategy"` (after `git add -A`).
+  def strategy do
+    Application.get_env(:ticket_rush, :reservation_strategy, TicketRush.Reservations.Postgres)
+  end
+
+  def hold(event_id, seat_id, user_id, opts), do: strategy().hold(event_id, seat_id, user_id, opts)
+  def confirm(reservation_id, user_id), do: strategy().confirm(reservation_id, user_id)
+  def release(reservation_id, user_id), do: strategy().release(reservation_id, user_id)
+end
+```
+
+**Step 5: Run, expect pass**
+
+Run: `make test ARGS=test/ticket_rush/reservations/postgres_test.exs`
+Expected: `13 tests, 0 failures`.
+
+Then verify zero-warning compilation and run the full test suite (`docker compose run --rm -e MIX_ENV=test api sh -c "mix compile --warnings-as-errors && mix test"`): `30 tests, 0 failures` (17 from Phases 1–2 + 13 new).
+
+**Step 6: Write study notes**
+
+Create `docs/notes/phase3.md` covering:
+- Why optimistic `INSERT ... ON CONFLICT DO NOTHING RETURNING *` avoids `25P02` ("current transaction is aborted") errors across dual unique indexes, explicit `BEGIN`/`COMMIT` transactions, and preemptive expiry `UPDATE`s before `INSERT` on the happy path (including the Ecto `{:ok, %Reservation{id: nil}}` idiom).
+- Why `confirm/2` and `release/2` invert read-then-write into atomic `Repo.update_all/3` with `select: r` (`RETURNING`), both guarded by `status == :held` and Postgres `now()` (`expires_at > now()`), and why `confirm/2` returns `{:error, :expired}` for both lapsed `:held` and already-`:expired` rows.
+- Clock-skew and precision note: `hold/4` computes `expires_at` from Elixir's `DateTime.utc_now/0` truncated to `:second` while `confirm/2`, `release/2`, and lazy expiry compare against Postgres `now()` (microsecond precision, and frozen at `transaction_timestamp()` under `SQL.Sandbox`); if app and DB hosts can drift by more than a few seconds, compute `expires_at` in Postgres via `now() + interval`.
+- Why `hold/4` takes `event_id` (enabling routing without a database lookup in Strategy A's `Registry`, and preventing cross-event seat spoofing in Strategy B), why `release/2` takes `user_id` (enforcing ownership), and why `release/2`'s `status == :held` guard blocks cancellation of `:confirmed` reservations.
+- **Alternatives Considered & Risks/Limits:**
+  - Inline lazy expiry in `hold/4` vs. Oban-only expiry (chosen: inline lazy expiry on conflict only; note the accepted transient `:taken` race if Oban sweeps an expired row between `INSERT` conflict and `UPDATE`).
+  - Strategy B hot-seat loser amplification: under 5k–10k concurrent buyers on one seat, each `:taken` loser runs 3 sequential queries (`INSERT` + `SELECT` + `UPDATE`) after the seat-membership check — a key comparison point against Strategy A in Phase 7's benchmark.
+  - Non-partial `reservations_user_idempotency_key_index` replay semantics (`:expired`/`:cancelled` rows still replay) and Strategy A/B parity across restarts.
+  - Deferral of `SELECT ... FOR UPDATE SKIP LOCKED` from the design doc (no "best available seat" endpoint yet).
+
+**Step 7: Commit and handoff**
+
+Update `docs/notes/progress.md` with the Phase 3 handoff entry, commit, push `feature/phase-3-strategy-b`, and open a Pull Request against `main`.
+
+```bash
+git add -A && git commit -m "feat: add reservation strategy behaviour and postgres strategy"
+```
 
 ---
 
