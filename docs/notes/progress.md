@@ -2,6 +2,25 @@
 
 Newest entry first.
 
+## 2026-11-26 — Phase 2 complete (Tasks 3 and 4 verified)
+
+- **Agent:** Antigravity
+- **Branch:** `feature/phase-2-ecto` (branched from `origin/main` after PR #1 merged)
+
+**Done and verified**
+- Completed full 5-stage design/readiness review on Phase 2 and updated `docs/2026-11-25-ticket-rush-design.md` and `docs/plans/2026-11-25-ticket-rush-implementation-plan.md` with *Active Schema Contracts (Phases 3–9)*.
+- Task 3: added `migration_timestamps: [type: :utc_datetime]` to `api/config/config.exs`, created `api/priv/repo/migrations/20261126225500_create_events_seats_reservations.exs` (`events`, `seats`, `reservations` with UTC timestamps, `CHECK` constraints, per-user `[:user_id, :idempotency_key]` uniqueness, `one_active_reservation_per_seat`, and `reservations_held_expiry_idx`), wrote `docs/notes/phase2.md`, and verified `api/test/ticket_rush/schema_invariant_test.exs` (`9 tests, 0 failures`, `0.7s`).
+- Task 4: created `TicketRush.Events.Event`, `TicketRush.Events.Seat`, `TicketRush.Reservations.Reservation` (with `Ecto.Enum` statuses, `:utc_datetime` timestamps, and `hold_changeset/2`), and `TicketRush.Fixtures`. Verified `mix compile --warnings-as-errors`, `api/test/ticket_rush/reservations/reservation_test.exs` (`6 tests, 0 failures`, `6.3s`), and the full test suite (`17 tests, 0 failures`, `4.1s`).
+
+**Not done**
+- Phase 3 (Strategy B — Postgres only) has not started.
+
+**Exact next step**
+1. Owner reviews and merges the Phase 2 PR into `main`.
+2. Create `feature/phase-3-strategy-b` from `main` and start **Phase 3, Task 5** (`Reservations.Strategy` behaviour and Postgres implementation), following *Active Schema Contracts (Phases 3–9)* in the plan (`Ecto.Enum` atoms, integer `user_id`, per-user `{user_id, idempotency_key}` lookups, and atomic `confirm`/expiry SQL guards).
+
+---
+
 ## 2026-11-26 — Phase 1 complete (Tasks 1 and 2 verified)
 
 - **Agent:** Antigravity
