@@ -13,6 +13,8 @@ defmodule TicketRush.Reservations.Reservation do
     timestamps()
   end
 
+  @type t :: %__MODULE__{}
+
   def hold_changeset(res, attrs) do
     res
     |> cast(attrs, [:seat_id, :user_id, :status, :idempotency_key, :expires_at])
