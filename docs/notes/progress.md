@@ -2,6 +2,27 @@
 
 Newest entry first.
 
+## 2026-11-27 — Phase 3 complete (Task 5 verified)
+
+- **Agent:** Antigravity
+- **Branch:** `feature/phase-3-strategy-b` (branched from `origin/main` after PR #2 merged)
+
+**Done and verified**
+- Completed full 5-stage design/readiness review on Phase 3 and updated `docs/2026-11-25-ticket-rush-design.md` and `docs/plans/2026-11-25-ticket-rush-implementation-plan.md` (optimistic `ON CONFLICT DO NOTHING RETURNING *`, `hold/4` with `event_id`, `release/2` with `user_id`, `:idempotency_conflict`, `:seat_not_found`, atomic `confirm/2` and `release/2` via `Repo.update_all/3` + `select: r` + Postgres `now()`).
+- Task 5:
+  - Added `@type t :: %__MODULE__{}` to `TicketRush.Reservations.Reservation`.
+  - Created `TicketRush.Reservations.Strategy` behaviour, `TicketRush.Reservations.Postgres` (Strategy B), `TicketRush.Reservations` facade, shared contract suite `TicketRush.ReservationStrategyCase`, `api/test/ticket_rush/reservations/postgres_test.exs`, and study notes in `docs/notes/phase3.md`.
+  - Verified `mix compile --warnings-as-errors`, `api/test/ticket_rush/reservations/postgres_test.exs` (`13 tests, 0 failures`, `1.4s`), and the full test suite (`30 tests, 0 failures`, `2.4s`).
+
+**Not done**
+- Phase 4 (Strategy A — OTP `EventArbiter` GenServer) has not started.
+
+**Exact next step**
+1. Owner reviews and merges the Phase 3 PR into `main`.
+2. Create `feature/phase-4-strategy-a` from `main` and start **Phase 4, Task 6** (`EventArbiter`, `ArbiterSupervisor`, `TicketRush.Reservations.Otp`), honoring the Phase 3 `Strategy` behaviour (`hold/4`, `confirm/2`, `release/2`) and *Active Schema Contracts* (note the 🛑 checkpoint in Task 6 before implementing).
+
+---
+
 ## 2026-11-26 — Phase 2 complete (Tasks 3 and 4 verified)
 
 - **Agent:** Antigravity
