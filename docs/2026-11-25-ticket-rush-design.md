@@ -44,10 +44,10 @@ CREATE UNIQUE INDEX one_active_reservation_per_seat
 
 ## Strategies
 
-Shared behaviour `Reservations.Strategy`: `hold/3`, `confirm/2`, `release/1`. Config selects the implementation; the same tests and benchmark run against both.
+Shared behaviour `Reservations.Strategy`: `hold/4` (`event_id, seat_id, user_id, opts`), `confirm/2` (`reservation_id, user_id`), `release/2` (`reservation_id, user_id`). Config selects the implementation; the same tests and benchmark run against both.
 
 - **A (OTP):** `DynamicSupervisor` + `Registry` → one `EventArbiter` GenServer per event serializes reservations in memory; `init/1` rehydrates from the database after a crash. Risk: the mailbox of a very hot event.
-- **B (Postgres):** a transaction using `INSERT ... ON CONFLICT DO NOTHING` backed by the partial index; `SELECT ... FOR UPDATE SKIP LOCKED` for "best available seat".
+- **B (Postgres):** optimistic `INSERT ... ON CONFLICT DO NOTHING RETURNING *` backed by the partial unique index and per-user idempotency index (with conflict-path replay lookup and targeted lazy-expiry retry), plus atomic `UPDATE ... RETURNING *` for `confirm/2` and `release/2`. `SELECT ... FOR UPDATE SKIP LOCKED` for "best available seat" is deferred unless needed.
 
 ## API (`/api/v1`)
 
